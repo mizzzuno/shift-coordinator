@@ -191,70 +191,117 @@ export class ShiftOptimizer {
       return;
     }
 
-    // 各シフトタイプに対してスタッフを割り当て
     Object.entries(shiftRules).forEach(([shiftType, rule]) => {
       if (rule && typeof rule === "object") {
         this.assignShiftStaff(date, shiftType, rule);
       }
     });
 
-    // パートタイマーのPMルール適用
     this.enforcePartTimerPMRule(date);
 
-    // PT21を必要に応じて日勤補助配置
+    // 事務員による不足穴埋めは早番のみ（直接不足している場合）
+    this.backfillShiftWithAdmins(date, "EARLY");
+
+    // ▼ 追加: 日勤/遅番不足を早番→スライド + 事務員早番代替で解消
+    this.coverDayLateShortageByRebalancingEarly(date);
+
     this.addSupplementalDayShiftPartTimer(date);
-
-    // 日勤不足時 事務員で穴埋め
-    this.backfillDayShiftWithAdmins(date);
-
-    // 連続勤務日数の更新
     this.updateConsecutiveWorkDays(date);
-
-    // 必須シフトの人員チェック
     this.checkMandatoryStaffing(date);
   }
 
   /**
-   * 日勤の人数が最小人数に達していない場合、事務員(ADMIN)で穴埋めする
-   * 看護師資格がなくても人数確保目的で配置（スキル要件より人数の確保を優先）
+   * 早番の人数が最小人数に達していない場合、事務員(ADMIN)で穴埋めする
+   * 対象シフト: EARLY のみ
    */
-  backfillDayShiftWithAdmins(date) {
+  backfillShiftWithAdmins(date, shiftType) {
+    if (shiftType !== "EARLY") return; // 制限: 早番のみ
     const dateKey = this.formatDate(date);
-    const rule = this.constraints?.shifts?.DAY;
+    const rule = this.constraints?.shifts?.[shiftType];
     if (!rule || !this.schedule[dateKey]) return;
+    if (!rule.mandatory) return;
 
-    const dayAssignments = this.schedule[dateKey].shifts.DAY || [];
-    const currentCount = dayAssignments.length;
-    const needed = (rule.minStaff || 0) - currentCount;
-    if (needed <= 0) return; // 足りている
+    const shiftAssignments = this.schedule[dateKey].shifts[shiftType] || [];
+    const currentCount = shiftAssignments.length;
+    const minNeeded = rule.minStaff || rule.requiredSkills?.length || 0;
+    const lacking = minNeeded - currentCount;
+    if (lacking <= 0) return;
 
-    // 既に何らかのシフトに入っている者は除外し、空いている事務員を取得
     const availableAdmins = this.employees.filter(
       (emp) =>
         emp.jobType === "ADMIN" &&
         !this.isEmployeeAlreadyAssigned(emp.id, dateKey)
     );
-
-    if (availableAdmins.length === 0) return; // 補充要員なし
+    if (availableAdmins.length === 0) return;
 
     let added = 0;
     for (const admin of availableAdmins) {
-      if (added >= needed) break;
-      this.schedule[dateKey].shifts.DAY.push({
+      if (added >= lacking) break;
+      this.schedule[dateKey].shifts[shiftType].push({
         employee: admin,
-        reason: "日勤不足穴埋め(事務員)",
+        reason: `${shiftType}不足穴埋め(事務員)`,
         isBackfill: true,
       });
       added++;
       this.staffingAlerts.push({
-        type: "DAY_BACKFILL_ADMIN",
+        type: `${shiftType}_BACKFILL_ADMIN`,
         severity: "info",
         date: dateKey,
         employee: admin.name,
-        message: `日勤最小人数不足のため事務員${admin.name}さんを穴埋め配置 (${
-          currentCount + added
-        }/${rule.minStaff})`,
+        message: `${shiftType}最小人数不足のため事務員${
+          admin.name
+        }さんを穴埋め配置 (${currentCount + added}/${minNeeded})`,
       });
+    }
+  }
+
+  /**
+   * DAY / LATE の不足を検知し、以下の手順で解消を試みる
+   * 1. 不足シフト(DAY or LATE)を確認
+   * 2. 早番(EARLY)から適格な職種(NURSE/CAREGIVER など)を選びスライド
+   * 3. 空いた EARLY 枠へ未割当の事務員(ADMIN)を投入（事務員は早番のみ可）
+   * 4. 必要人数に達するか、候補が尽きるまで繰り返し
+   */
+  coverDayLateShortageByRebalancingEarly(date) {
+    const dateKey = this.formatDate(date);
+    const daySchedule = this.schedule[dateKey];
+    if (!daySchedule) return;
+
+    const targetShifts = ["DAY", "LATE"];
+    for (const targetShift of targetShifts) {
+      const rule = this.constraints?.shifts?.[targetShift];
+      if (!rule || !rule.mandatory) continue;
+
+      const currentStaff = daySchedule.shifts[targetShift]?.length || 0;
+      const requiredStaff = rule.minStaff || rule.requiredSkills?.length || 0;
+      let remainingShortage = requiredStaff - currentStaff;
+
+      if (remainingShortage <= 0) continue;
+
+      const availableAdmins = this.employees.filter(
+        (e) =>
+          e.jobType === "ADMIN" &&
+          !this.isEmployeeAlreadyAssigned(e.id, dateKey)
+      );
+
+      let restShortage = Math.min(remainingShortage, availableAdmins.length);
+
+      for (let i = 0; i < restShortage; i++) {
+        const admin = availableAdmins[i];
+        daySchedule.shifts.EARLY.push({
+          employee: admin,
+          reason: "日勤/遅番不足のため早番に割当",
+          isBackfill: true,
+        });
+
+        this.staffingAlerts.push({
+          type: "ADMIN_ASSIGNED_TO_EARLY",
+          severity: "info",
+          date: dateKey,
+          employee: admin.name,
+          message: `${admin.name}さんを日勤/遅番不足のため早番に割当しました`,
+        });
+      }
     }
   }
 
@@ -471,6 +518,29 @@ export class ShiftOptimizer {
       rule,
       shiftType
     );
+
+    // ▼ minStaff 充足ロジック追加 (requiredSkills より多い最小人数が設定されている場合を埋める)
+    const minStaff = rule.minStaff || assignments.length;
+    if (assignments.length < minStaff) {
+      const already = new Set(assignments.map((a) => a.employee.id));
+      const extras = availableEmployees
+        .filter((e) => !already.has(e.id))
+        .sort(
+          (a, b) =>
+            this.countEmployeeWorkDays(a.id) - this.countEmployeeWorkDays(b.id)
+        );
+      const lacking = minStaff - assignments.length;
+      for (let i = 0; i < lacking && i < extras.length; i++) {
+        assignments.push({
+          employee: extras[i],
+          reason: `${shiftType}最小人数充足追加(${
+            assignments.length + 1
+          }/${minStaff})`,
+          isAutoFill: true,
+        });
+      }
+    }
+
     this.schedule[dateKey].shifts[shiftType].push(...assignments);
   }
 
@@ -1363,6 +1433,7 @@ export class ShiftOptimizer {
       );
 
       for (const admin of adminNurses) {
+        // 修正: if の括弧を追加
         if (this.isEmployeeWorking(admin.id, dateKey)) continue;
 
         // 事務員を看護師として配置
@@ -1514,7 +1585,7 @@ export class ShiftOptimizer {
       if (!rule.mandatory) return;
 
       const assignedCount = daySchedule.shifts[shiftType]?.length || 0;
-      const requiredCount = rule.requiredSkills.length;
+      const requiredCount = rule.minStaff || rule.requiredSkills.length; // 修正: minStaff を優先
 
       if (assignedCount < requiredCount) {
         this.staffingAlerts.push({
